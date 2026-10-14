@@ -21,9 +21,12 @@ MetaScalp Listing Radar & Telegram Bot
 
 import asyncio
 import aiohttp
+from aiohttp import web
 import os
 import time
+import json
 import logging
+from datetime import datetime, date
 from typing import Dict, Set, List
 
 # Настройка логирования
@@ -33,16 +36,52 @@ logger = logging.getLogger("MetaScalpRadar")
 # Настройки из переменных окружения (Render / .env)
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "ВАШ_ТОКЕН_БОТА")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "ВАШ_CHAT_ID")
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "30")) # интервал проверки в секундах
-NOTIFY_MAX_EXCHANGES = int(os.getenv("NOTIFY_MAX_EXCHANGES", "3")) # максимум бирж (1-3)
+CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "60")) # интервал проверки (сек)
+NOTIFY_MAX_EXCHANGES = int(os.getenv("NOTIFY_MAX_EXCHANGES", "2")) # максимум бирж (1-2 по умолчанию)
+MAX_DAILY_ALERTS = int(os.getenv("MAX_DAILY_ALERTS", "10")) # максимум алертов в день, чтобы не спамить
+MIN_VOLUME_USD = float(os.getenv("MIN_VOLUME_USD", "20000")) # фильтр объема: не слать мертвые монеты < $20k
+ENABLE_VOLATILITY = os.getenv("ENABLE_VOLATILITY", "false").lower() == "true" # спам по колебаниям цен ВЫКЛЮЧЕН
 
-# Кэш известных монет, чтобы не спамить повторно
-# Ключ: 'SYMBOL', Значение: {'exchanges': set(), 'first_seen': timestamp, 'last_price': float}
+# Файл персистентной истории (чтобы при перезапуске сервера не присылать одни и те же монеты!)
+HISTORY_FILE = "sent_history.json"
 KNOWN_COINS: Dict[str, dict] = {}
 INITIALIZED = False
 
+def load_sent_history() -> Dict[str, str]:
+    """Загрузка истории уже отправленных монет"""
+    if os.path.exists(HISTORY_FILE):
+        try:
+            with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+def save_sent_coin(symbol: str):
+    """Сохранение монеты в историю с сегодняшней датой"""
+    hist = load_sent_history()
+    today_str = date.today().isoformat()
+    hist[symbol] = today_str
+    try:
+        with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+            json.dump(hist, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.warning(f"Не удалось сохранить историю: {e}")
+
+def get_today_sent_count() -> int:
+    """Сколько алертов уже было отправлено за сегодня"""
+    hist = load_sent_history()
+    today_str = date.today().isoformat()
+    return sum(1 for sym, dt in hist.items() if dt == today_str)
+
+def was_sent_recently(symbol: str) -> bool:
+    """Проверка: отправлялась ли эта монета сегодня (чтобы не слать по кругу!)"""
+    hist = load_sent_history()
+    today_str = date.today().isoformat()
+    return hist.get(symbol) == today_str
+
 async def send_telegram_alert(session: aiohttp.ClientSession, message: str):
-    """Отправка сообщения в Telegram чат"""
+    """Отправка сообщения в Telegram чат с гарантированной защитой от спам-блокировок"""
     if not TELEGRAM_BOT_TOKEN or TELEGRAM_BOT_TOKEN == "ВАШ_ТОКЕН_БОТА":
         logger.warning("Telegram Bot Token не задан. Сообщение не отправлено:\n%s", message)
         return
@@ -55,11 +94,22 @@ async def send_telegram_alert(session: aiohttp.ClientSession, message: str):
     }
     try:
         async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=8)) as resp:
-            if resp.status != 200:
+            if resp.status == 200:
+                logger.info("Уведомление успешно доставлено в Telegram.")
+            elif resp.status == 429:
+                # Telegram Flood Control: защита от спам-бана
+                data = await resp.json()
+                retry_after = data.get("parameters", {}).get("retry_after", 30)
+                logger.warning(f"Telegram просит паузу {retry_after} сек (Flood Control). Ждем...")
+                await asyncio.sleep(retry_after)
+            else:
                 err = await resp.text()
                 logger.error(f"Ошибка отправки Telegram: {err}")
     except Exception as e:
         logger.error(f"Сетевая ошибка Telegram: {e}")
+
+    # Обязательная анти-спам пауза 4 секунды между любыми сообщениями
+    await asyncio.sleep(4)
 
 async def fetch_mexc(session: aiohttp.ClientSession) -> Dict[str, dict]:
     """Сканирование спота и фьючерсов MEXC"""
@@ -242,7 +292,7 @@ async def scan_market(session: aiohttp.ClientSession):
         )
         return
 
-    # Проверка новых листингов
+    # Проверка новых листингов с защитой от спама
     for sym, data in current_state.items():
         exchanges = data["exchanges"]
         num_exchanges = len(exchanges)
@@ -255,8 +305,24 @@ async def scan_market(session: aiohttp.ClientSession):
                 "first_seen": time.time()
             }
 
-            # Фильтр: если монета залистилась не более чем на 3 биржах
+            # 1. Защита от дублей: если монета уже отправлялась сегодня — НЕ ШЛЕМ ВТОРОЙ РАЗ!
+            if was_sent_recently(sym):
+                continue
+
+            # 2. Фильтр количества бирж (1-2 биржи в приоритете)
             if num_exchanges <= NOTIFY_MAX_EXCHANGES:
+                
+                # 3. Фильтр мертвого мусора по объему
+                if data["total_volume"] < MIN_VOLUME_USD and data["total_volume"] > 0:
+                    continue
+
+                # 4. Дневной лимит (чтобы не забить Telegram и не получить бан за спам)
+                sent_today = get_today_sent_count()
+                if sent_today >= MAX_DAILY_ALERTS:
+                    logger.info(f"Дневной лимит алертов ({MAX_DAILY_ALERTS}) исчерпан. На сегодня достаточно.")
+                    break
+
+                current_alert_num = sent_today + 1
                 tier_badge = "🌟 <b>[1 БИРЖА - ЭКСКЛЮЗИВНЫЙ ГЕМ]</b>" if num_exchanges == 1 else f"⚡ <b>[{num_exchanges} БИРЖИ]</b>"
                 spot_list = [e for e, m in data["markets"].items() if m == "SPOT"]
                 fut_list = [e for e, m in data["markets"].items() if m == "FUTURES"]
@@ -275,31 +341,64 @@ async def scan_market(session: aiohttp.ClientSession):
                     f"{fut_str}\n\n"
                     f"📋 <b>Тикер для MetaScalp:</b>\n"
                     f"<code>{primary_ticker}</code>\n\n"
-                    f"⚡ <i>Скопируйте в привод MetaScalp для мгновенного входа в стакан!</i>"
+                    f"📊 <i>[Алерт {current_alert_num} из {MAX_DAILY_ALERTS} на сегодня • Без повторов]</i>"
                 )
-                logger.info(f"НОВЫЙ ЛИСТИНГ: #{sym} на {exchanges}")
+                logger.info(f"НОВЫЙ ЛИСТИНГ: #{sym} на {exchanges} (Алерт {current_alert_num}/{MAX_DAILY_ALERTS})")
                 await send_telegram_alert(session, msg)
-        else:
-            # Проверка волатильности для известных свежих монет
-            old_price = KNOWN_COINS[sym].get("last_price", 0)
-            new_price = data["latest_price"]
-            if old_price > 0 and new_price > 0:
-                pct_change = ((new_price - old_price) / old_price) * 100
-                if abs(pct_change) >= 15.0 and (time.time() - KNOWN_COINS[sym].get("first_seen", 0) < 86400):
-                    # Алерт о спайке волатильности
-                    direction = "🚀 ВСПЛЕСК (+{:.1f}%)".format(pct_change) if pct_change > 0 else "💥 ДАМП ({:.1f}%)".format(pct_change)
-                    primary_ticker = data["meta_tickers"][0]
-                    msg = (
-                        f"{direction} <b>по монете #{sym}!</b>\n"
-                        f"💰 <b>Цена:</b> ${new_price}\n"
-                        f"🏛 <b>Биржи:</b> {', '.join(exchanges)}\n"
-                        f"📋 <b>MetaScalp:</b> <code>{primary_ticker}</code>"
+                save_sent_coin(sym)
+
+                # Если достигнут дневной максимум, отправляем финальное спокойное уведомление
+                if current_alert_num >= MAX_DAILY_ALERTS:
+                    limit_msg = (
+                        f"💤 <b>Дневной лимит ({MAX_DAILY_ALERTS} монет) исчерпан!</b>\n"
+                        f"На сегодня этого более чем достаточно для торговли в MetaScalp.\n"
+                        f"Бот переходит в тихий режим до завтра, чтобы не спамить ваш Telegram."
                     )
-                    await send_telegram_alert(session, msg)
-                    KNOWN_COINS[sym]["last_price"] = new_price
+                    await send_telegram_alert(session, limit_msg)
+                    break
+        else:
+            # Проверка волатильности (ТОЛЬКО если явно включена в настройках, чтобы не слать по кругу!)
+            if ENABLE_VOLATILITY:
+                old_price = KNOWN_COINS[sym].get("last_price", 0)
+                new_price = data["latest_price"]
+                if old_price > 0 and new_price > 0 and not was_sent_recently(sym):
+                    pct_change = ((new_price - old_price) / old_price) * 100
+                    if abs(pct_change) >= 25.0: # Повышенный порог 25% вместо 15%
+                        direction = "🚀 ВСПЛЕСК (+{:.1f}%)".format(pct_change) if pct_change > 0 else "💥 ДАМП ({:.1f}%)".format(pct_change)
+                        primary_ticker = data["meta_tickers"][0]
+                        msg = (
+                            f"{direction} <b>по монете #{sym}!</b>\n"
+                            f"💰 <b>Цена:</b> ${new_price}\n"
+                            f"🏛 <b>Биржи:</b> {', '.join(exchanges)}\n"
+                            f"📋 <b>MetaScalp:</b> <code>{primary_ticker}</code>"
+                        )
+                        await send_telegram_alert(session, msg)
+                        save_sent_coin(sym)
+                        KNOWN_COINS[sym]["last_price"] = new_price
+
+async def handle_health(request):
+    return web.Response(text="MetaScalp Listing Radar is RUNNING! Free Web Service active.")
+
+async def start_web_server():
+    """Запуск легкого HTTP-сервера для бесплатного тарифа Render Web Service (Free $0)"""
+    port = int(os.getenv("PORT", 10000))
+    app = web.Application()
+    app.router.add_get("/", handle_health)
+    app.router.add_get("/health", handle_health)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    logger.info(f"Health-check HTTP сервер запущен на порту {port} (Бесплатный тариф Render Free $0)")
 
 async def main():
     logger.info("Старт фонового демона MetaScalp Listing Radar...")
+    # Запускаем встроенный HTTP health-check для Render Free Web Service
+    try:
+        await start_web_server()
+    except Exception as e:
+        logger.warning(f"Не удалось запустить HTTP сервер (нормально для локального запуска): {e}")
+
     async with aiohttp.ClientSession() as session:
         while True:
             try:
